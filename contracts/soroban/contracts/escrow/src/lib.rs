@@ -26,6 +26,9 @@ pub const MIN_MATCH_DURATION_SECS: u64 = 120;
 pub const MAX_MATCH_DURATION_SECS: u64 = 86_400;
 /// Duration (in seconds) of the escrow emergency drain timelock delay (7 days = 604,800s) (Issue #285).
 pub const EMERGENCY_DRAIN_TIMELOCK_SECS: u64 = 604_800;
+/// Duration (in seconds) an Active match may go without coordinator resolution before either
+/// player may claim an emergency self-refund (72 hours) (Issue #433).
+pub const EMERGENCY_TIMEOUT_SECONDS: u64 = 259_200;
 pub const DEFAULT_MIN_WAGER: i128 = 1;
 /// Default maximum allowable wager amount (maximum positive i128).
 pub const DEFAULT_MAX_WAGER: i128 = i128::MAX;
@@ -165,6 +168,8 @@ pub enum MatchStatus {
     Resolved = 2,
     /// Match canceled or timed out, wagers refunded to players.
     Refunded = 3,
+    /// Active match emergency-refunded by a player after coordinator inactivity timelock (Issue #433).
+    EmergencyRefunded = 4,
 }
 
 /// Lifecycle status of a tournament prize pool.
@@ -403,6 +408,17 @@ pub struct MatchCancelledEvent {
 pub struct MatchRefundedEvent {
     /// Identifier of the refunded match.
     pub game_code: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Published when a player claims an emergency self-refund on a coordinator-abandoned
+/// Active match after the emergency timelock elapses (Issue #433).
+pub struct MatchEmergencyRefundedEvent {
+    /// Identifier of the emergency-refunded match.
+    pub game_code: String,
+    /// Address of the player who invoked the emergency refund.
+    pub caller: Address,
 }
 
 #[contracttype]
@@ -3022,6 +3038,42 @@ impl ChessterEscrow {
         );
     }
 
+    /// Allows either registered player in an Active match to claim an emergency self-refund once
+    /// the match has gone `EMERGENCY_TIMEOUT_SECONDS` without coordinator resolution, protecting
+    /// locked player funds from coordinator infrastructure failure (Issue #433).
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    /// * `caller` - Address of the player claiming the refund (must be `player1` or `player2`).
+    /// * `game_code` - Unique match game code.
+    pub fn emergency_refund(env: Env, caller: Address, game_code: String) {
+        let _guard = ReentrancyGuard::new(&env);
+        caller.require_auth();
+
+        let mut m = Self::load_match(&env, &game_code);
+
+        if m.status != MatchStatus::Active {
+            panic_with_error!(&env, EscrowError::MatchNotActive);
+        }
+
+        if caller != m.player1 && Some(caller.clone()) != m.player2 {
+            panic_with_error!(&env, EscrowError::UnauthorizedPlayer);
+        }
+
+        Self::ensure_dispute_not_locked(&env, &game_code);
+
+        if env.ledger().timestamp() < m.created_at + EMERGENCY_TIMEOUT_SECONDS {
+            panic_with_error!(&env, EscrowError::TimeoutNotExpired);
+        }
+
+        Self::execute_emergency_refund(&env, &game_code, &mut m);
+
+        env.events().publish(
+            (symbol_short!("emer_ref"), game_code.clone()),
+            MatchEmergencyRefundedEvent { game_code, caller },
+        );
+    }
+
     fn settle_match(
         env: &Env,
         coordinator: &Address,
@@ -3275,7 +3327,10 @@ impl ChessterEscrow {
             panic_with_error!(&env, EscrowError::Unauthorized);
         }
 
-        if m.status == MatchStatus::Resolved || m.status == MatchStatus::Refunded {
+        if m.status == MatchStatus::Resolved
+            || m.status == MatchStatus::Refunded
+            || m.status == MatchStatus::EmergencyRefunded
+        {
             panic_with_error!(&env, EscrowError::AlreadyResolvedOrRefunded);
         }
 
@@ -3310,7 +3365,10 @@ impl ChessterEscrow {
             panic_with_error!(&env, EscrowError::Unauthorized);
         }
 
-        if m.status == MatchStatus::Resolved || m.status == MatchStatus::Refunded {
+        if m.status == MatchStatus::Resolved
+            || m.status == MatchStatus::Refunded
+            || m.status == MatchStatus::EmergencyRefunded
+        {
             panic_with_error!(&env, EscrowError::AlreadyResolvedOrRefunded);
         }
 
@@ -3379,7 +3437,10 @@ impl ChessterEscrow {
         let _guard = ReentrancyGuard::new(&env);
         let mut m = Self::load_match(&env, &game_code);
 
-        if m.status == MatchStatus::Resolved || m.status == MatchStatus::Refunded {
+        if m.status == MatchStatus::Resolved
+            || m.status == MatchStatus::Refunded
+            || m.status == MatchStatus::EmergencyRefunded
+        {
             panic_with_error!(&env, EscrowError::AlreadyResolvedOrRefunded);
         }
 
@@ -3406,7 +3467,10 @@ impl ChessterEscrow {
         let _guard = ReentrancyGuard::new(&env);
         let mut m = Self::load_match(&env, &game_code);
 
-        if m.status == MatchStatus::Resolved || m.status == MatchStatus::Refunded {
+        if m.status == MatchStatus::Resolved
+            || m.status == MatchStatus::Refunded
+            || m.status == MatchStatus::EmergencyRefunded
+        {
             panic_with_error!(&env, EscrowError::AlreadyResolvedOrRefunded);
         }
 
@@ -3853,6 +3917,70 @@ impl ChessterEscrow {
         );
     }
 
+    /// Splits an Active match's remaining locked collateral evenly between both players and marks
+    /// the match `EmergencyRefunded`, bypassing the coordinator-settlement path entirely (Issue #433).
+    fn execute_emergency_refund(env: &Env, game_code: &String, m: &mut Match) {
+        let token_client = token::Client::new(env, &m.token);
+
+        let pool_key = (Symbol::new(env, "side_p"), game_code.clone());
+        let side_total =
+            if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
+                pool.total_player1_side_staked + pool.total_player2_side_staked
+            } else {
+                0
+            };
+
+        Self::assert_balance_invariant(env, &m.token);
+
+        let p2 = m
+            .player2
+            .clone()
+            .unwrap_or_else(|| panic_with_error!(env, EscrowError::MatchNotActive));
+
+        let half_wager = m.total_staked / 2;
+        let remaining_half = m.total_staked - half_wager;
+        token_client.transfer(&env.current_contract_address(), &m.player1, &half_wager);
+        token_client.transfer(&env.current_contract_address(), &p2, &remaining_half);
+
+        if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
+            for bet in pool.bets.iter() {
+                token_client.transfer(&env.current_contract_address(), &bet.spectator, &bet.amount);
+            }
+            Self::bump_entry_ttl(env, &pool_key);
+        }
+
+        Self::sub_locked(env, &m.token, m.total_staked + side_total);
+        Self::assert_balance_invariant(env, &m.token);
+
+        m.status = MatchStatus::EmergencyRefunded;
+        env.storage().persistent().set(game_code, m);
+        Self::bump_entry_ttl(env, game_code);
+
+        Self::remove_from_active_lists(env, game_code, m);
+
+        // Update platform metrics (Issue #288)
+        let mut metrics = env
+            .storage()
+            .persistent()
+            .get::<_, PlatformMetrics>(&DataKey::Metrics)
+            .unwrap_or(PlatformMetrics {
+                total_matches_created: 0,
+                active_matches_count: 0,
+                total_volume_xlm: 0,
+                total_rake_collected: 0,
+            });
+        metrics.active_matches_count = metrics.active_matches_count.saturating_sub(1);
+        env.storage().persistent().set(&DataKey::Metrics, &metrics);
+        Self::bump_entry_ttl(env, &DataKey::Metrics);
+
+        emit_match_event(
+            env,
+            symbol_short!("emer_ref"),
+            m.nonce,
+            (None::<Address>, m.total_staked, 0_i128).into_val(env),
+        );
+    }
+
     /// Retrieves details for a specific match.
     ///
     /// # Arguments
@@ -4062,7 +4190,9 @@ impl ChessterEscrow {
 
     fn gc_stale_match_internal(env: &Env, game_code: &String, now: u64) -> bool {
         if let Some(m) = env.storage().persistent().get::<_, Match>(game_code) {
-            if (m.status == MatchStatus::Resolved || m.status == MatchStatus::Refunded)
+            if (m.status == MatchStatus::Resolved
+                || m.status == MatchStatus::Refunded
+                || m.status == MatchStatus::EmergencyRefunded)
                 && now >= m.created_at + STALE_MATCH_THRESHOLD_SECS
             {
                 env.storage().persistent().remove(game_code);
