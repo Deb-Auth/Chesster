@@ -12,6 +12,14 @@ const leaderboardService = require("../services/leaderboardService");
 
 const AUDIT_FORMATS = new Set(["json", "csv"]);
 
+// How long a game-state snapshot (game + moves) used for reconnect/state
+// reconciliation (Issue #434) may be served from cache before refetching.
+// Kept intentionally short: it only exists to collapse duplicate Supabase
+// round trips when a flaky connection emits several reconcile/reconnect
+// attempts within the same instant, not to serve long-lived stale data. The
+// live clock is always computed fresh by timerService and is never cached.
+const GAME_STATE_SNAPSHOT_TTL_MS = 500;
+
 class GameController {
 	constructor() {
 		for (const key of Object.getOwnPropertyNames(Object.getPrototypeOf(this))) {
@@ -19,6 +27,40 @@ class GameController {
 				this[key] = this[key].bind(this);
 			}
 		}
+		// gameCode -> { snapshot: { game, moves }, expiresAt }
+		this._gameStateSnapshotCache = new Map();
+	}
+
+	/**
+	 * Builds (or returns a short-lived cached) snapshot of a game's
+	 * authoritative state used for reconnect/state-reconciliation (Issue #434):
+	 * the current game row and its full move list. See `invalidateGameStateSnapshot`.
+	 *
+	 * @param {string} gameCode
+	 * @returns {Promise<{game: object, moves: object[]}|null>}
+	 */
+	async getGameStateSnapshot(gameCode) {
+		const cached = this._gameStateSnapshotCache.get(gameCode);
+		if (cached && cached.expiresAt > Date.now()) {
+			return cached.snapshot;
+		}
+
+		const game = await gameModel.getGame(gameCode);
+		if (!game) return null;
+
+		const moves = await gameModel.getMoves(gameCode);
+		const snapshot = { game, moves };
+
+		this._gameStateSnapshotCache.set(gameCode, {
+			snapshot,
+			expiresAt: Date.now() + GAME_STATE_SNAPSHOT_TTL_MS,
+		});
+		return snapshot;
+	}
+
+	/** Drops any cached snapshot so the next reconcile/reconnect reads fresh state. */
+	invalidateGameStateSnapshot(gameCode) {
+		this._gameStateSnapshotCache.delete(gameCode);
 	}
 
 	publishGameEnded(game, endReason) {

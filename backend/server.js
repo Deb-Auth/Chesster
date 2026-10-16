@@ -30,7 +30,11 @@ const {
   verifySocketToken,
   resolvePlayerColor,
   authorizeMove,
+  handleDisconnect,
+  handleReconnect,
+  reconcileGameState,
 } = require("./socket/moveAuthority");
+const gameController = require("./controllers/gameController");
 const { createRateLimiter } = require("./middleware/rateLimiter");
 const { sanitizeInput } = require("./middleware/sanitizeInput");
 const { moderateMessage, checkSlowMode } = require("./services/chatService");
@@ -44,6 +48,7 @@ const {
   LeaveGameSchema,
   SpectatorReactionSchema,
   ReconnectGameSchema,
+  ReconcileStateSchema,
   RequestRematchSchema,
   SendChatSchema,
   SpectatorMessageSchema,
@@ -322,6 +327,10 @@ io.on("connection", (socket) => {
       const moverColor = game.current_turn;
       const updated = await gameModel.makeMove(gameCode, from, to, promotion);
       metricsRoutes.observeMoveLatency(moveStartedAt);
+      // Invalidate the reconcile/reconnect snapshot cache so a client that
+      // reconciles immediately after this move sees it, not a stale snapshot
+      // (Issue #434).
+      gameController.invalidateGameStateSnapshot(gameCode);
 
       let clock = null;
       if (updated.status === "active") {
@@ -376,13 +385,8 @@ io.on("connection", (socket) => {
     // fresher reconnect (e.g. rapid refresh / duplicate tabs).
     if (presence[playerColor].socketId !== socket.id) return;
 
-    try {
-      const gameModel = require("./models/gameModel");
-      const game = await gameModel.getGame(gameCode);
-      if (!game || game.status !== "active") return;
-    } catch (e) {
-      return;
-    }
+    const { shouldStartGrace } = await handleDisconnect({ gameModel }, gameCode, playerColor);
+    if (!shouldStartGrace) return;
 
     presence[playerColor].socketId = null;
     broadcastPresence(gameCode, playerColor, "reconnecting");
@@ -535,6 +539,53 @@ io.on("connection", (socket) => {
     } catch (err) {
       logger.error("reconnect_game handler error", { error: err.message, stack: err.stack });
       sendAck(err.message || "Reconnection failed");
+    }
+  }));
+
+  // Versioned state-reconciliation protocol (Issue #434): a reconnecting
+  // client reports the highest move index it has already applied, and the
+  // server returns only the moves it missed plus a freshly computed
+  // authoritative clock, instead of re-sending the full game state on every
+  // reconnect. Must be called on a socket already bound to a player color via
+  // `join-game` (or `reconnect_game`), which performs the JWT-authenticated
+  // color binding this handler relies on.
+  socket.on("reconcile_state", validateSocketPayload(ReconcileStateSchema, async (payload, ack) => {
+    const sendAck = (error, data) => {
+      if (typeof ack === "function") ack({ error, data });
+    };
+    const { gameId, lastKnownMoveIndex } = payload;
+
+    const boundColor = socket.data.playerColor;
+    if (!boundColor || socket.data.gameCode !== gameId || !socket.data.address) {
+      return sendAck("not-a-player");
+    }
+
+    try {
+      // Re-derive seat ownership and cancel any pending auto-forfeit grace
+      // timer from live game state (not just the socket's cached binding),
+      // before any further await lets the timer race against firing.
+      const reconnect = await handleReconnect(
+        { gameModel, timerService },
+        gameId,
+        socket.data.address,
+      );
+      if (!reconnect.ok) {
+        return sendAck(reconnect.message || "not-a-player");
+      }
+
+      const reconciled = await reconcileGameState(
+        { gameController, timerService, chessEngine },
+        gameId,
+        lastKnownMoveIndex,
+        reconnect.playerColor,
+      );
+      if (!reconciled) return sendAck("game-not-found");
+
+      socket.emit("STATE_RECONCILED", reconciled);
+      sendAck(null, { success: true });
+    } catch (err) {
+      logger.error("reconcile_state handler error", { error: err.message, stack: err.stack });
+      sendAck(err.message || "Reconciliation failed");
     }
   }));
 
